@@ -1,4 +1,4 @@
-name: 🎯 Hassan Ahmadi - Download
+name: 🎯 YouTube Downloader
 
 on:
   workflow_dispatch:
@@ -31,20 +31,25 @@ on:
         type: string
         default: '720'
       max_videos:
-        description: '🔢 Max results (up to 100 or more)'
+        description: '🔢 Max results (if playlist_start/end not set)'
         required: false
         type: number
-        default: 100
+        default: 10
+      playlist_start:
+        description: '▶️ Start index (session) in playlist (1-based)'
+        required: false
+        type: number
+        default: 1
+      playlist_end:
+        description: '⏹️ End index (session) in playlist (0 = until end)'
+        required: false
+        type: number
+        default: 0
       split_threshold_mb:
         description: '📦 Split > MB (0=no)'
         required: false
         type: number
         default: 50
-      output_folder:
-        description: '📁 Output Folder Name (where to save videos)'
-        required: false
-        type: string
-        default: 'downloads'
 
 env:
   PYTHONUNBUFFERED: '1'
@@ -83,7 +88,6 @@ jobs:
           [[ "$M" == "channel" && "$U" != http* ]] && U="https://www.youtube.com/$([[ "$U" == @* ]] && echo "$U" || echo "@$U")"
           echo "URL=$U" >> $GITHUB_OUTPUT
           echo "MODE=$M" >> $GITHUB_OUTPUT
-          echo "OUTPUT_FOLDER=${{ github.event.inputs.output_folder }}" >> $GITHUB_OUTPUT
 
       - name: 🎯 Download & Process
         id: main
@@ -93,8 +97,9 @@ jobs:
           TYPE: ${{ github.event.inputs.type }}
           QUALITY: ${{ github.event.inputs.quality }}
           MAX: ${{ github.event.inputs.max_videos }}
+          START: ${{ github.event.inputs.playlist_start }}
+          END: ${{ github.event.inputs.playlist_end }}
           SPLIT: ${{ github.event.inputs.split_threshold_mb }}
-          OUTPUT_FOLDER: ${{ steps.prep.outputs.OUTPUT_FOLDER }}
         run: |
           python3 << 'PYEOF'
           import os, json, time, re, subprocess, sys, hashlib
@@ -106,9 +111,16 @@ jobs:
           U = os.environ['URL']
           T = os.environ['TYPE']
           Q = os.environ.get('QUALITY', '720')
-          MX = int(os.environ.get('MAX', '100'))  # Default now 100
+          MX = int(os.environ.get('MAX', '10'))
+          START_IDX = int(os.environ.get('START', '1'))
+          END_IDX = int(os.environ.get('END', '0'))
           SP = int(os.environ.get('SPLIT', '50'))
-          BASE_OUTPUT = os.environ.get('OUTPUT_FOLDER', 'downloads')
+
+          # تصحیح بازه: اگر END صفر باشد تا انتها
+          if END_IDX == 0:
+              END_IDX = MX
+          else:
+              END_IDX = min(END_IDX, MX)
 
           API = 'https://hub.ytconvert.org/api/download'
           H = {
@@ -119,29 +131,12 @@ jobs:
               'Origin': 'https://media.ytmp3.gg'
           }
 
-          def safe_name(text, maxlen=100):
-              """Create safe filename from text (longer for full video titles)"""
-              safe = re.sub(r'[^\w\s\-]', '', text)
-              safe = re.sub(r'[\s]+', '_', safe)
+          def safe_name(text, maxlen=40):
+              safe = re.sub(r'[^\w]', '_', text)[:maxlen]
               safe = re.sub(r'_+', '_', safe).strip('_')
-              safe = safe[:maxlen]
               if not safe:
                   safe = hashlib.md5(text.encode()).hexdigest()[:8]
               return safe
-
-          def get_video_title(vid):
-              """Get actual video title using yt-dlp"""
-              try:
-                  r = subprocess.run(
-                      ['yt-dlp', '--get-title', '--no-warnings', '--no-check-certificate',
-                       f'https://youtube.com/watch?v={vid}'],
-                      capture_output=True, text=True, timeout=15
-                  )
-                  if r.returncode == 0 and r.stdout.strip():
-                      return r.stdout.strip()
-              except:
-                  pass
-              return None
 
           def fm(n):
               if not n: return 'N/A'
@@ -151,7 +146,6 @@ jobs:
               except: return str(n)
 
           def gv(vid):
-              """Get video info AND channel name from actual video data"""
               try:
                   r = subprocess.run(
                       ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
@@ -162,7 +156,6 @@ jobs:
                       d = json.loads(r.stdout)
                       channel = (d.get('channel') or d.get('uploader') or 
                                 d.get('uploader_id') or d.get('creator') or 'Unknown')
-                      title = d.get('title', 'Untitled')
                       views = d.get('view_count')
                       duration = d.get('duration', 0)
                       channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
@@ -172,9 +165,9 @@ jobs:
                           if m: handle = m.group(1)
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
-                      return (channel.strip() if channel else 'Unknown', title, views, int(duration) if duration else 0, handle)
+                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
               except: pass
-              return ('Unknown', 'Untitled', None, 0, None)
+              return ('Unknown', None, 0, None)
 
           def get_channel_from_url(url):
               m = re.search(r'@([\w-]+)', url)
@@ -196,74 +189,79 @@ jobs:
                       d = json.loads(r.stdout.strip().split('\n')[0])
                       vid = d.get('id', '')
                       if vid:
-                          ch, _, _, _, handle = gv(vid)
+                          _, _, _, handle = gv(vid)
                           if handle: return handle
                       ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
                       if ch: return safe_name(ch, 30)
               except: pass
               return None
 
-          def gvl(u, n):
-              v = []
+          def gvl(u, start, end):
+              # استخراج ویدیوها با رعایت بازه
               channel_folder = get_channel_from_url(u)
-              
               if not channel_folder and 'playlist' in u:
                   print(f'   🔍 Detecting channel from playlist...')
                   channel_folder = get_channel_from_playlist(u)
-              
               if not channel_folder:
                   channel_folder = 'playlist_videos'
-              
-              print(f'   📁 Target folder: {BASE_OUTPUT}/{channel_folder}_videos')
-              
+              print(f'   📁 Main Folder: {channel_folder}_videos')
+
+              # ساخت آرگومان‌های yt-dlp با رعایت start/end
               c = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
-              if n > 0: c.extend(['--playlist-end', str(n)])
+              if end > 0:
+                  c.extend(['--playlist-start', str(start), '--playlist-end', str(end)])
+              else:
+                  c.extend(['--playlist-start', str(start)])
               c.append(u)
-              r = subprocess.run(c, capture_output=True, text=True, timeout=60)  # Increased timeout for large playlists
-              
+              r = subprocess.run(c, capture_output=True, text=True, timeout=30)
+              v = []
               for line in r.stdout.strip().split('\n'):
-                  if line and len(v) < n:
-                      try:
-                          d = json.loads(line)
-                          vid = d.get('id', '')
-                          if not vid: continue
-                          
-                          flat_title = d.get('title', 'Untitled')
-                          print(f'   📊 [{len(v)+1}/{n}] {flat_title[:50]}...')
-                          
-                          ch, full_title, vw, dr, handle = gv(vid)
-                          
-                          if not ch or ch == 'Unknown':
-                              ch = (d.get('channel') or d.get('uploader') or 
-                                    d.get('uploader_id') or d.get('creator') or 'Unknown')
-                          if not vw: vw = d.get('view_count')
-                          if not dr: dr = d.get('duration', 0)
-                          
-                          # Use the real video title
-                          video_title = full_title if full_title != 'Untitled' else flat_title
-                          
-                          v.append({
-                              'id': vid, 
-                              't': video_title,
-                              'flat_t': flat_title,
-                              'u': f'https://youtube.com/watch?v={vid}',
-                              'dr': int(dr) if dr else 0,
-                              'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
-                              'c': str(ch).strip() if ch else 'Unknown',
-                              'v': fm(vw)
-                          })
-                      except Exception as e:
-                          print(f'      ⚠️ Skip: {str(e)[:40]}')
-                          continue
-              
+                  if not line: continue
+                  try:
+                      d = json.loads(line)
+                      vid = d.get('id', '')
+                      if not vid: continue
+                      title = d.get('title', 'Untitled')[:60]
+                      print(f'   📊 Found: {title}...')
+                      ch, vw, dr, _ = gv(vid)
+                      if not ch or ch == 'Unknown':
+                          ch = (d.get('channel') or d.get('uploader') or 
+                                d.get('uploader_id') or d.get('creator') or 'Unknown')
+                      if not vw: vw = d.get('view_count')
+                      if not dr: dr = d.get('duration', 0)
+                      v.append({
+                          'id': vid, 't': title,
+                          'u': f'https://youtube.com/watch?v={vid}',
+                          'dr': int(dr) if dr else 0,
+                          'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                          'c': str(ch).strip() if ch else 'Unknown',
+                          'v': fm(vw)
+                      })
+                  except Exception as e:
+                      print(f'      ⚠️ Skip: {str(e)[:40]}')
+                      continue
               return v, channel_folder
+
+          def mkidx(v, cn, cd):
+              # همان فهرست اصلی (اختیاری)
+              ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+              Path('./playlists').mkdir(exist_ok=True)
+              idxf = f'playlists/{cn}_{ts}.md'
+              m = (f'# 📺 {cn}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} videos**\n\n'
+                   f'| # | Thumbnail | Title | Duration | Views |\n'
+                   f'|---|-----------|-------|----------|-------|\n')
+              for i, x in enumerate(v, 1):
+                  dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
+                  m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
+              Path(idxf).write_text(m)
+              print(f'📄 Index: {idxf}')
+              return idxf
 
           def dl_video(u):
               e = 'mp3' if T == 'audio' else 'mp4'
               p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
               if T == 'audio': p['audio'] = {'bitrate': f'{Q}k'}
               else: p['output']['quality'] = f'{Q}p'
-
               for retry in range(3):
                   if retry > 0:
                       print(f'   🔄 Retry {retry}/3...')
@@ -321,72 +319,79 @@ jobs:
                   return True
               return False
 
+          def git_commit_push(batch_num):
+              """مرحله‌ای git commit & push"""
+              print(f'\n💾 Batch {batch_num}: Storing to GitHub...')
+              subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=False)
+              subprocess.run(['git', 'config', 'user.email', 'bot@github.com'], check=False)
+              subprocess.run(['git', 'add', '-A'], check=False)
+              # بررسی وجود تغییر
+              status = subprocess.run(['git', 'diff', '--cached', '--quiet'], check=False)
+              if status.returncode == 0:
+                  print('   No changes to commit.')
+                  return
+              # commit
+              subprocess.run(['git', 'commit', '-m', f'📦 Batch {batch_num} - {datetime.now():%H%M} [skip ci]'], check=False)
+              # push با retry
+              for retry in range(3):
+                  if subprocess.run(['git', 'pull', '--rebase', '--quiet'], check=False).returncode == 0 and \
+                     subprocess.run(['git', 'push', '--quiet'], check=False).returncode == 0:
+                      print('   ✅ Stored successfully.')
+                      return
+                  time.sleep(5)
+              print('   ⚠️ Push failed (will retry later).')
+
           print(f'{"="*50}')
           print(f'🎬 {M.upper()} MODE')
-          print(f'📁 Output base folder: {BASE_OUTPUT}')
-          print(f'🔢 Max videos: {MX}')
           print(f'{"="*50}')
 
           if M == 'search':
-              v, _ = gvl(f'ytsearch{MX}:{U}', MX)
+              # حالت جستجو (بدون تغییر)
+              v, _ = gvl(f'ytsearch{MX}:{U}', 1, MX)
               if not v: print('❌ No results'); sys.exit(1)
-              
-              # Create search folder
-              search_folder = Path(f'{BASE_OUTPUT}/search_results')
-              search_folder.mkdir(parents=True, exist_ok=True)
-              
-              qs = safe_name(U, 30)
               ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-              f = search_folder / f'{qs}_{ts}.md'
-              
+              Path('./searches').mkdir(exist_ok=True)
+              qs = safe_name(U, 30)
+              f = f'searches/{qs}_{ts}.md'
               m = (f'# 🔍 Search: {U}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} results**\n\n'
                    f'| # | Thumbnail | Title | Channel | Views | Duration |\n'
                    f'|---|-----------|-------|---------|-------|----------|\n')
               for i, x in enumerate(v, 1):
                   m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {x["c"][:20]} | {x["v"]} | {x["dr"]//60}m |\n'
-              m += '\n---\n\n'
-              for i, x in enumerate(v, 1):
-                  m += (f'### {i}. {x["t"]}\n\n<img src="{x["th"]}" width="640">\n\n'
-                       f'| Property | Value |\n|----------|-------|\n'
-                       f'| Channel | {x["c"]} |\n| Duration | {x["dr"]//60}m |\n'
-                       f'| Views | {x["v"]} |\n| ID | `{x["id"]}` |\n| URL | {x["u"]} |\n\n---\n\n')
-              f.write_text(m)
-              print(f'✅ Search results saved to {f}')
+              Path(f).write_text(m)
+              print(f'✅ {f}')
+              # نیازی به commit مرحله‌ای نیست
+              git_commit_push(1)
 
           elif M in ('playlist', 'channel'):
-              print(f'\n📋 Extracting videos...')
-              v, cn = gvl(U, MX)
-              if not v: print('❌ No videos found'); sys.exit(1)
+              print(f'\n📋 Extracting videos from {START_IDX} to {END_IDX}...')
+              v, cn = gvl(U, START_IDX, END_IDX)
+              if not v: print('❌ No videos found in this range'); sys.exit(1)
 
-              # Create folder (exist_ok=True means don't recreate if exists)
-              cd = Path(f'{BASE_OUTPUT}/{cn}_videos')
-              cd.mkdir(parents=True, exist_ok=True)
-              print(f'📁 Using folder: {cd} {"(already existed)" if cd.exists() else "(created new)"}')
+              main_folder = Path(f'downloads/{cn}_videos')
+              main_folder.mkdir(parents=True, exist_ok=True)
 
-              ok, fl = [], []
-              print(f'\n📥 Downloading {len(v)} videos...\n{"="*50}')
+              print(f'\n📝 Creating index...')
+              mkidx(v, cn, main_folder)
+
+              print(f'\n📥 Downloading {len(v)} videos (in per‑video folders)...\n{"="*50}')
               
-              for i, x in enumerate(v, 1):
-                  print(f'\n📥 [{i}/{len(v)}]')
-                  print(f'   Title: {x["t"][:50]}...')
+              ok, fl = [], []
+              for i, x in enumerate(v, start=START_IDX):  # شماره جلسه واقعی
+                  subfolder = main_folder / f'{i:03d}_{safe_name(x["t"], 30)}_{x["id"]}'
+                  subfolder.mkdir(parents=True, exist_ok=True)
+                  
+                  print(f'\n📥 [{i}/{END_IDX}] {x["t"]}')
                   print(f'   Channel: {x["c"]} | Duration: {x["dr"]//60}m | Views: {x["v"]}')
+                  print(f'   📁 {subfolder.name}/')
                   
                   result = dl_video(x['u'])
                   if result:
-                      # Use video title as filename (with safe characters)
-                      safe_title = safe_name(x['t'], 80)
-                      filename = f'{safe_title}_{x["id"]}.{result["e"]}'
-                      fp = cd / filename
-                      
-                      # Check if file already exists
-                      if fp.exists():
-                          print(f'   ⏭️ File already exists, skipping: {filename}')
-                          ok.append(x['t'])
-                          continue
-                      
+                      # فایل داخل پوشه اختصاصی ویدیو ذخیره می‌شود
+                      fp = subfolder / f'video.{result["e"]}'
                       size = download_file(result['u'], fp)
                       if size:
-                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB) as: {filename}')
+                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
                           split_file(fp, SP)
                           ok.append(x['t'])
                       else:
@@ -396,103 +401,55 @@ jobs:
                       print(f'   ❌ Conversion failed')
                       fl.append(x['t'])
                   
-                  if i < len(v): 
+                  # ذخیره‌سازی مرحله‌ای هر ۱۰ ویدیو
+                  if (i - START_IDX + 1) % 10 == 0 or i == END_IDX:
+                      git_commit_push((i - START_IDX + 1) // 10 + 1)
+                  
+                  if i < END_IDX: 
                       print(f'   ⏳ Waiting...')
                       time.sleep(2)
 
+              Path('/tmp/meta.json').write_text(json.dumps({
+                  'm': M, 'cd': str(main_folder), 'ok': len(ok), 'fl': len(fl), 'total': len(v)
+              }))
               print(f'\n{"="*50}')
               print(f'📊 {len(ok)}/{len(v)} downloaded successfully')
-              print(f'📁 Saved in: {cd}')
               if fl: print(f'❌ Failed: {fl}')
               print(f'{"="*50}')
 
           else:
-              # Single video mode
-              print(f'\n📹 Single video mode')
-              
+              # حالت تک ویدیو
               vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
-              if not vid_match:
-                  print('❌ Could not extract video ID')
-                  sys.exit(1)
-              
-              vid = vid_match.group(1)
-              
-              # Get video info (title and channel)
-              ch, title, _, _, handle = gv(vid)
-              print(f'   📹 Title: {title}')
-              print(f'   📺 Channel: {ch}')
-              
-              # Determine folder
+              vid = vid_match.group(1) if vid_match else 'x'
+              ch, _, _, handle = gv(vid)
               cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
-              
               result = dl_video(U)
               if result:
-                  cd = Path(f'{BASE_OUTPUT}/{cn}_videos')
-                  cd.mkdir(parents=True, exist_ok=True)
-                  print(f'📁 Using folder: {cd} {"(already existed)" if cd.exists() else "(created new)"}')
-                  
-                  # Use video title as filename
-                  safe_title = safe_name(title, 80)
-                  filename = f'{safe_title}_{vid}.{result["e"]}'
-                  fp = cd / filename
-                  
-                  if fp.exists():
-                      print(f'   ⏭️ File already exists: {filename}')
-                  else:
-                      size = download_file(result['u'], fp)
-                      if size:
-                          print(f'✅ Saved: {filename}')
-                          print(f'   📁 Location: {cd}/')
-                          print(f'   📦 Size: {size/1e6:.1f}MB')
-                          split_file(fp, SP)
-                      else:
-                          print('❌ Download failed')
-                          sys.exit(1)
+                  main_folder = Path(f'downloads/{cn}_videos')
+                  main_folder.mkdir(parents=True, exist_ok=True)
+                  # برای تک ویدیو هم پوشه مجزا ساخته می‌شود
+                  subfolder = main_folder / f'001_{safe_name("single", 10)}_{vid}'
+                  subfolder.mkdir(exist_ok=True)
+                  fp = subfolder / f'video.{result["e"]}'
+                  size = download_file(result['u'], fp)
+                  if size:
+                      print(f'✅ Saved to {cn}_videos/{subfolder.name}/ ({size/1e6:.1f}MB)')
+                      split_file(fp, SP)
+                      git_commit_push(1)
               else:
-                  print('❌ Conversion failed'); sys.exit(1)
+                  print('❌ Failed'); sys.exit(1)
           
           PYEOF
 
-      - name: 📤 Push Files
+      - name: 📤 Final Push (just in case)
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📤 PUSHING TO GITHUB"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
+          echo "📤 Ensuring final push..."
           git config user.name "github-actions[bot]"
           git config user.email "bot@github.com"
-          
-          echo ""
-          echo "📋 Adding all files..."
           git add -A
-          
-          TOTAL=$(git diff --cached --name-only | wc -l)
-          echo "   Found $TOTAL files"
-          
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "❌ Nothing to push"
-            exit 0
-          fi
-          
-          git diff --cached --name-only | while read f; do
-            echo "   📎 $f"
+          git diff --cached --quiet || git commit -m "📦 Final $(date +%m%d-%H%M) [skip ci]" --quiet
+          for i in 1 2 3; do
+            git pull --rebase --quiet && git push --quiet && break
+            sleep $((i*5))
           done
-          
-          echo ""
-          echo "📤 Pushing..."
-          
-          git commit -m "📦 $(date +%m%d-%H%M) [skip ci]" --quiet
-          
-          for i in 1 2 3 4 5; do
-            echo -n "   🚀 Attempt $i/5..."
-            if git pull --rebase --quiet 2>/dev/null && git push --quiet 2>/dev/null; then
-              echo " ✅ DONE!"
-              exit 0
-            fi
-            echo " ❌"
-            git rebase --abort 2>/dev/null
-            [ $i -lt 5 ] && sleep $((i*5))
-          done
-          
-          echo "   ❌ Push failed"
-          exit 1
